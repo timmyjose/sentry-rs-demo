@@ -48,7 +48,8 @@ where
             match fut.await {
                 Ok(res) => {
                     if let Some(err) = res.response().error() {
-                        error!(path, ?err)
+                        let status_code = err.as_response_error().status_code().as_u16();
+                        error!(path, ?err, status_code = status_code)
                     }
                     Ok(res)
                 }

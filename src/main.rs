@@ -1,4 +1,6 @@
+use sentry_tracing::{event_from_event, EventMapping};
 use std::{env, sync::Arc};
+use tracing::{error, event, field::Visit, info, Level};
 
 use actix_cors::Cors;
 use actix_web::{
@@ -8,9 +10,7 @@ use actix_web::{
 };
 use middleware::Middleware;
 use sentry::ClientInitGuard;
-use sentry_tracing::EventFilter;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
 use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod middleware;
@@ -20,7 +20,10 @@ pub enum Error {
     #[error("cannot divide by zero")]
     DivideByZero,
 
-    #[error("SENRTY_DSN is unset")]
+    #[error("value is 42!")]
+    Value42,
+
+    #[error("SENTRY_DSN is unset")]
     MissingSentryDsn,
 
     #[error(transparent)]
@@ -33,6 +36,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+impl ResponseError for HTTPError {
+    fn status_code(&self) -> StatusCode {
+        self.status_code
+    }
+}
+
 #[derive(Debug)]
 pub struct HTTPError {
     pub status_code: StatusCode,
@@ -43,15 +52,21 @@ impl std::error::Error for HTTPError {}
 
 impl std::fmt::Display for HTTPError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ {}, {} }}", self.status_code, self.source)
+        // write!(f, "{{ {}, {} }}", self.status_code, self.source)
+        write!(f, "{}", self.source)
     }
 }
 
 impl From<Error> for HTTPError {
     fn from(err: Error) -> Self {
+        // sentry::capture_error(&err);
         let http_error = match err {
             Error::DivideByZero => HTTPError {
                 status_code: StatusCode::BAD_REQUEST,
+                source: err.into(),
+            },
+            Error::Value42 => HTTPError {
+                status_code: StatusCode::SEE_OTHER,
                 source: err.into(),
             },
             _ => HTTPError {
@@ -71,14 +86,18 @@ impl From<Error> for HTTPError {
     }
 }
 
-impl ResponseError for HTTPError {}
-
 pub type HttpResult<T> = std::result::Result<T, HTTPError>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 async fn add(x: i32, y: i32) -> Result<i32> {
-    Ok(x + y)
+    let sum = x + y;
+
+    if sum == 42 {
+        Err(Error::Value42)
+    } else {
+        Ok(sum)
+    }
 }
 
 async fn sub(x: i32, y: i32) -> Result<i32> {
@@ -94,6 +113,23 @@ async fn div(x: i32, y: i32) -> Result<i32> {
         Err(Error::DivideByZero)
     } else {
         Ok(x + y)
+    }
+}
+
+#[derive(Debug)]
+struct SentryEventVisitor {
+    status_code: u16,
+}
+
+impl Visit for SentryEventVisitor {
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        println!("Inside record_u64, field name = {}", field.name());
+        if field.name() == "status_code" {
+            println!("Setting STATUS CODE");
+            self.status_code = value as u16;
+        }
     }
 }
 
@@ -118,9 +154,21 @@ async fn init_tracing() -> Result<ClientInitGuard> {
         },
     ));
 
-    let sentry_layer = sentry_tracing::layer().event_filter(|md| match md.level() {
-        &tracing::Level::ERROR => EventFilter::Event,
-        _ => EventFilter::Ignore,
+    let sentry_layer = sentry_tracing::layer().event_mapper(|evt, ctx| {
+        // println!("event = {evt:#?}");
+        let mut sentry_visitor = SentryEventVisitor { status_code: 200 };
+        evt.record(&mut sentry_visitor);
+        // println!("sentry_visitor = {sentry_visitor:#?}");
+
+        if (400..500).contains(&sentry_visitor.status_code) {
+            println!("[sentry-layer] intercepted a 4xx error - not sending to Sentry");
+            EventMapping::Ignore
+        } else if evt.metadata().level() != &tracing::Level::ERROR {
+            EventMapping::Ignore
+        } else {
+            // send the original `sentry` event unchanged
+            EventMapping::Event(event_from_event(evt, ctx))
+        }
     });
 
     let log_level_filter = EnvFilter::new("INFO");
@@ -150,7 +198,6 @@ async fn handle_add(
     body: web::Json<CalculationRequest>,
 ) -> HttpResult<web::Json<CalculationResponse>> {
     info!(method = "handle_add", ?body, "adding two numbers together");
-    error!("add");
 
     let x = body.x;
     let y = body.y;
@@ -169,6 +216,7 @@ async fn handle_sub(
         ?body,
         "subtracting a number from another"
     );
+    event!(Level::ERROR, status_code = 401, "subbbbb");
 
     let x = body.x;
     let y = body.y;
